@@ -20,78 +20,68 @@ def init_db():
         );
     """)
 
-    # Estados financieros
+    # Estados financieros (BG y ER)
     c.execute("""
-        CREATE TABLE IF NOT EXISTS estados_financieros (
+       CREATE TABLE IF NOT EXISTS estados_financieros (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             empresa_id INTEGER,
-            tipo_estado TEXT,
+            tipo_estado TEXT,      -- BG o ER
+            periodicidad TEXT,     -- "anual" o "mensual"
             año INTEGER,
+            mes INTEGER,           -- 1 a 12, NULL si es anual
             cuenta TEXT,
-            monto REAL,
-            FOREIGN KEY (empresa_id) REFERENCES empresas(id)
-        );
-    """)
-
-    # Análisis vertical
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS analisis_vertical (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            empresa_id INTEGER,
-            año INTEGER,
-            cuenta TEXT,
-            porcentaje REAL
-        );
-    """)
-
-    # Análisis horizontal
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS analisis_horizontal (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            empresa_id INTEGER,
-            año_base INTEGER,
-            año_comp INTEGER,
-            cuenta TEXT,
-            variacion_abs REAL,
-            variacion_pct REAL
-        );
-    """)
-
-    # Razones financieras
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS razones_financieras (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            empresa_id INTEGER,
-            año INTEGER,
-            razon TEXT,
-            valor REAL
-        );
-    """)
-
-    # Sistema DuPont
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS dupont (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            empresa_id INTEGER,
-            año INTEGER,
-            margen REAL,
-            rotacion REAL,
-            apalancamiento REAL,
-            roe REAL
-        );
-    """)
-
-    # Flujo de efectivo
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS flujo_efectivo (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            empresa_id INTEGER,
-            año INTEGER,
-            actividad TEXT,
-            concepto TEXT,
-            monto REAL
+             monto REAL
         );
     """)
 
     conn.commit()
     conn.close()
+
+
+# -------------------------------------------------------
+# ✔ FUNCIONES CRUD
+# -------------------------------------------------------
+
+# 🟦 1. Registrar empresa
+def crear_empresa(nombre, sector, fecha_registro):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO empresas (nombre, sector, fecha_registro)
+        VALUES (?, ?, ?)
+    """, (nombre, sector, fecha_registro))
+    conn.commit()
+    conn.close()
+
+# 🟩 2. Listar empresas
+def obtener_empresas():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, nombre FROM empresas")
+    data = c.fetchall()
+    conn.close()
+    return data
+
+# 🟧 3. Guardar un estado financiero (BG o ER)
+def guardar_estado(empresa_id, tipo_estado, año, cuenta, monto):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO estados_financieros (empresa_id, tipo_estado, año, cuenta, monto)
+        VALUES (?, ?, ?, ?, ?)
+    """, (empresa_id, tipo_estado, año, cuenta, monto))
+    conn.commit()
+    conn.close()
+
+# 🟨 4. Obtener estados financieros por empresa y año
+def obtener_estado(empresa_id, tipo_estado, año):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT cuenta, monto
+        FROM estados_financieros
+        WHERE empresa_id = ? AND tipo_estado = ? AND año = ?
+    """, (empresa_id, tipo_estado, año))
+    rows = c.fetchall()
+    conn.close()
+    return rows

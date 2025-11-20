@@ -4,11 +4,15 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from st_aggrid import AgGrid, GridOptionsBuilder
-from openai import OpenAI
-import io
-import base64
-from datetime import datetime
+from google import genai
+import io 
+import os
 import re
+import base64
+import traceback
+import db
+from datetime import datetime
+db.init_db()
 
 # ----------------------------
 # Config página y paleta
@@ -36,6 +40,44 @@ st.markdown(f"""
     hr.st-sep {{border:0; height:1px; background:#1e293b; margin:18px 0;}}
     .footer {{text-align:center; color:#8b94a3; font-size:0.85rem; padding:10px;}}
     </style>
+     
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+#pulse-loader {
+    position: fixed;
+    top: 40%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 28px;
+    color: #9A7BFF;
+    animation: pulse 1s infinite;
+    display: none;
+    z-index: 99999;
+}
+
+@keyframes pulse {
+  0% { transform: scale(0.95) translate(-50%, -50%); opacity: 0.7; }
+  50% { transform: scale(1.05) translate(-50%, -50%); opacity: 1; }
+  100% { transform: scale(0.95) translate(-50%, -50%); opacity: 0.7; }
+}
+</style>
+
+<div id="pulse-loader">Cargando sección...</div>
+
+<script>
+let oldSection = window.sessionStorage.getItem("current_section");
+let newSection = "{{section}}";
+
+if (oldSection !== newSection) {
+    document.getElementById("pulse-loader").style.display = "block";
+    setTimeout(() => {
+        document.getElementById("pulse-loader").style.display = "none";
+    }, 700);  // duración del efecto
+}
+
+window.sessionStorage.setItem("current_section", newSection);
+</script>
 """, unsafe_allow_html=True)
 
 st.markdown("<div class='big-title'>DashBoard - FinanSys</div>", unsafe_allow_html=True)
@@ -329,20 +371,64 @@ def compute_ratios(balance_df: pd.DataFrame, results_df: pd.DataFrame) -> dict:
     return r
 
 def compute_dupont(balance_df: pd.DataFrame, results_df: pd.DataFrame) -> pd.DataFrame:
-    bal = map_accounts(balance_df, ACCOUNT_MAP_BALANCE); res = map_accounts(results_df, ACCOUNT_MAP_RESULTS)
-    ventas = safe_get(res, "VENTAS_NETAS"); un = safe_get(res, "UTILIDAD_NETA"); at = safe_get(bal, "ACTIVO_TOTAL"); pat = safe_get(bal, "PATRIMONIO")
+    bal = map_accounts(balance_df, ACCOUNT_MAP_BALANCE)
+    res = map_accounts(results_df, ACCOUNT_MAP_RESULTS)
+
+    ventas = safe_get(res, "VENTAS_NETAS")
+    utilidad_neta = safe_get(res, "UTILIDAD_NETA")
+    activo_total = safe_get(bal, "ACTIVO_TOTAL")
+    patrimonio = safe_get(bal, "PATRIMONIO")
+
     eps = 1e-9
-    margen_neto = un / max(ventas, eps); rot_act = ventas / max(at, eps); apalancamiento = at / max(pat, eps)
-    roe = margen_neto * rot_act * apalancamiento
-    df = pd.DataFrame({
-        "Componente": ["Margen Neto (%)", "Rotación de Activos (veces)", "Apalancamiento Financiero (veces)", "ROE (%)"],
-        "Valor": [round(margen_neto * 100, 2), round(rot_act, 2), round(apalancamiento, 2), round(roe * 100, 2)]
+
+    # Componentes DuPont
+    margen_neto = utilidad_neta / max(ventas, eps)
+    rotacion_activos = ventas / max(activo_total, eps)
+    apalancamiento = activo_total / max(patrimonio, eps)
+
+    # ROE final
+    roe = margen_neto * rotacion_activos * apalancamiento
+
+    dupont_df = pd.DataFrame({
+        "Componente": [
+            "Margen Neto (Utilidad Neta / Ventas)",
+            "Rotación de Activos (Ventas / Activo Total)",
+            "Apalancamiento Financiero (Activo Total / Patrimonio)",
+            "ROE (Retorno sobre el Patrimonio)"
+        ],
+        "Valor": [
+            round(margen_neto, 4),
+            round(rotacion_activos, 4),
+            round(apalancamiento, 4),
+            round(roe, 4)
+        ]
     })
-    return df
+
+    return dupont_df
+
+
 
 # ----------------------------
 # Flujo de efectivo (Indirecto + Directo)
 # ----------------------------
+
+def remove_totals(df):
+    """
+    Elimina todas las filas que sean totales:
+    total, subtotal, suma, activo total, pasivo total, patrimonio total, etc.
+    """
+    d = df.copy()
+    d["Cuenta_norm"] = d["Cuenta"].apply(norm_account_name)
+
+    d = d[~d["Cuenta_norm"].str.contains(
+        r"\btotal\b|\bsubtotal\b|\bsuma\b|activo total|pasivo total|patrimonio total|activos totales|pasivos totales",
+        regex=True,
+        na=False
+    )]
+
+    d["Monto"] = to_numeric_series(d["Monto"])
+    return d
+
 def compute_cashflow_indirect(balance_df_act: pd.DataFrame, results_df_act: pd.DataFrame, balance_df_prev: pd.DataFrame) -> pd.DataFrame:
     bal_a = map_accounts(balance_df_act, ACCOUNT_MAP_BALANCE); res_a = map_accounts(results_df_act, ACCOUNT_MAP_RESULTS); bal_p = map_accounts(balance_df_prev, ACCOUNT_MAP_BALANCE)
     un = safe_get(res_a, "UTILIDAD_NETA"); depr = safe_get(res_a, "DEPRECIACION")
@@ -367,112 +453,331 @@ def compute_cashflow_indirect(balance_df_act: pd.DataFrame, results_df_act: pd.D
     return pd.DataFrame(data)
 
 def compute_cashflow_direct(balance_df_act: pd.DataFrame, results_df_act: pd.DataFrame) -> pd.DataFrame:
-    # Método directo: estimaciones basadas en partidas comunes.
-    # Intenta extraer pagos de proveedores, sueldos, impuestos e intereses desde ER/BG.
-    bal_map = map_accounts(balance_df_act, ACCOUNT_MAP_BALANCE); res_map = map_accounts(results_df_act, ACCOUNT_MAP_RESULTS)
+    """
+    Flujo de Efectivo Método DIRECTO — versión SIN totales.
+    Solo usa cuentas operativas reales del BG y ER.
+    """
 
-    cobros_clientes = safe_get(res_map, "VENTAS_NETAS")
-    pagos_proveedores = safe_get(bal_map, "PROVEEDORES")
+    # -----------------------------
+    # LIMPIAR: remover totales
+    # -----------------------------
+    bal = remove_totals(balance_df_act)
+    res = remove_totals(results_df_act)
 
-    # Estimación de sueldos y gastos: buscar líneas en ER con palabras clave
-    df_res = results_df_act.copy()
-    if "Cuenta" in df_res.columns and "Monto" in df_res.columns:
-        df_res["Cuenta_norm"] = df_res["Cuenta"].apply(norm_account_name)
-        df_res["Monto"] = to_numeric_series(df_res["Monto"])
-        mask_gastos = df_res["Cuenta_norm"].str.contains(r"gasto|gastos|sueldos|salari|remuner|honorari|servicio", na=False)
-        pagos_sueldos_y_gastos = float(df_res.loc[mask_gastos, "Monto"].sum())
-        mask_impuestos = df_res["Cuenta_norm"].str.contains(r"impuest|iva|isr|tribut", na=False)
-        pagos_impuestos = float(df_res.loc[mask_impuestos, "Monto"].sum())
-        mask_intereses = df_res["Cuenta_norm"].str.contains(r"interes|intereses|gasto financiero", na=False)
-        pagos_intereses = float(df_res.loc[mask_intereses, "Monto"].sum())
-    else:
-        pagos_sueldos_y_gastos = 0.0
-        pagos_impuestos = 0.0
-        pagos_intereses = 0.0
+    # -----------------------------
+    # COBROS A CLIENTES
+    # -----------------------------
+    ventas = res.loc[
+        res["Cuenta_norm"].str.contains(r"venta|ingreso", na=False),
+        "Monto"
+    ].sum()
 
-    flujo_operativo_directo = round(cobros_clientes - pagos_proveedores - pagos_sueldos_y_gastos - pagos_impuestos - pagos_intereses, 2)
+    cxc = bal.loc[
+        bal["Cuenta_norm"].str.contains(r"cobrar|cliente|deudor", na=False),
+        "Monto"
+    ].sum()
 
-    data = {
+    cobros_clientes = ventas - cxc
+
+    # -----------------------------
+    # PAGOS A PROVEEDORES
+    # -----------------------------
+    compras = res.loc[
+        res["Cuenta_norm"].str.contains(r"costo", na=False),
+        "Monto"
+    ].sum()
+
+    cxp = bal.loc[
+        bal["Cuenta_norm"].str.contains(r"pagar|proveedor", na=False),
+        "Monto"
+    ].sum()
+
+    pagos_proveedores = -(compras - cxp)
+
+    # -----------------------------
+    # GASTOS OPERATIVOS PAGADOS
+    # -----------------------------
+    gastos_operativos = res.loc[
+        res["Cuenta_norm"].str.contains(r"gasto|operaci|servicio", na=False),
+        "Monto"
+    ].sum()
+
+    pagos_operativos = -gastos_operativos
+
+    # -----------------------------
+    # IMPUESTOS & INTERESES
+    # -----------------------------
+    impuestos = res.loc[
+        res["Cuenta_norm"].str.contains(r"impuesto|isr|iva|tribut", na=False),
+        "Monto"
+    ].sum()
+
+    intereses = res.loc[
+        res["Cuenta_norm"].str.contains(r"interes|financ", na=False),
+        "Monto"
+    ].sum()
+
+    pagos_impuestos = -impuestos
+    pagos_intereses = -intereses
+
+    # -----------------------------
+    # TOTAL
+    # -----------------------------
+    flujo_operativo = cobros_clientes + pagos_proveedores + pagos_operativos + pagos_impuestos + pagos_intereses
+
+    df = pd.DataFrame({
         "Concepto": [
-            "Cobros por ventas (estimado)",
-            "Pagos a proveedores (estimado)",
-            "Pagos de sueldos y gastos operativos (estimado)",
-            "Pagos de impuestos (estimado)",
-            "Pagos de intereses (estimado)",
-            "Flujo Operativo Directo (estimado)"
+            "Cobros por ventas",
+            "Pagos a proveedores",
+            "Pagos operativos",
+            "Pagos de impuestos",
+            "Pagos de intereses",
+            "Flujo Operativo Directo"
         ],
-        "Monto":[
-            round(cobros_clientes,2),
-            round(-pagos_proveedores,2),
-            round(-pagos_sueldos_y_gastos,2),
-            round(-pagos_impuestos,2),
-            round(-pagos_intereses,2),
-            flujo_operativo_directo
+        "Monto": [
+            round(cobros_clientes, 2),
+            round(pagos_proveedores, 2),
+            round(pagos_operativos, 2),
+            round(pagos_impuestos, 2),
+            round(pagos_intereses, 2),
+            round(flujo_operativo, 2)
         ]
-    }
-    return pd.DataFrame(data)
+    })
+
+    return df
+def compute_cashflow_indirect(balance_df_act: pd.DataFrame, results_df_act: pd.DataFrame, balance_df_prev: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flujo de Efectivo Método INDIRECTO.
+    Usa variaciones del BG real (cuentas operativas solamente).
+    """
+
+    bal_a = remove_totals(balance_df_act)
+    bal_p = remove_totals(balance_df_prev)
+    res_a = remove_totals(results_df_act)
+
+    # --- Utilidad Neta ---
+    utilidad_neta = res_a.loc[
+        res_a["Cuenta_norm"].str.contains(r"utilidad neta|resultado neto|ganancia", na=False),
+        "Monto"
+    ].sum()
+
+    # --- Depreciación ---
+    depreciacion = res_a.loc[
+        res_a["Cuenta_norm"].str.contains(r"deprecia|amortiz", na=False),
+        "Monto"
+    ].sum()
+
+    # --- Variaciones operativas ---
+    def get_val(df, pattern):
+        return df.loc[df["Cuenta_norm"].str.contains(pattern, na=False), "Monto"].sum()
+
+    cxc_a = get_val(bal_a, r"cobrar|cliente|deudor")
+    cxc_p = get_val(bal_p, r"cobrar|cliente|deudor")
+
+    inv_a = get_val(bal_a, r"invent")
+    inv_p = get_val(bal_p, r"invent")
+
+    prov_a = get_val(bal_a, r"pagar|proveedor")
+    prov_p = get_val(bal_p, r"pagar|proveedor")
+
+    # Variaciones
+    cambio_cxc = cxc_a - cxc_p
+    cambio_inv = inv_a - inv_p
+    cambio_prov = prov_a - prov_p
+
+    flujo_operativo = utilidad_neta + depreciacion - cambio_cxc - cambio_inv + cambio_prov
+
+    # --- Inversión: PPE (cambia el activo fijo real, no totales) ---
+    af_a = get_val(bal_a, r"propiedad|activo fijo|equipo|ppe")
+    af_p = get_val(bal_p, r"propiedad|activo fijo|equipo|ppe")
+
+    flujo_inversion = -(af_a - af_p)
+
+    # --- Financiamiento: cambios en deudas y capital (sin totales) ---
+    deuda_a = get_val(bal_a, r"deuda|obligacion|prestamo|credito")
+    deuda_p = get_val(bal_p, r"deuda|obligacion|prestamo|credito")
+
+    capital_a = get_val(bal_a, r"patrimonio|capital social")
+    capital_p = get_val(bal_p, r"patrimonio|capital social")
+
+    flujo_financiamiento = (deuda_a - deuda_p) + (capital_a - capital_p)
+
+    flujo_total = flujo_operativo + flujo_inversion + flujo_financiamiento
+
+    df = pd.DataFrame({
+        "Concepto": [
+            "Utilidad Neta",
+            "Depreciación y Amortización",
+            "Ajuste Cuentas por Cobrar",
+            "Ajuste Inventarios",
+            "Ajuste Proveedores",
+            "Flujo de Operación (A)",
+            "Flujo de Inversión (B)",
+            "Flujo de Financiamiento (C)",
+            "Flujo Neto (A+B+C)"
+        ],
+        "Monto": [
+            round(utilidad_neta, 2),
+            round(depreciacion, 2),
+            round(-cambio_cxc, 2),
+            round(-cambio_inv, 2),
+            round(cambio_prov, 2),
+            round(flujo_operativo, 2),
+            round(flujo_inversion, 2),
+            round(flujo_financiamiento, 2),
+            round(flujo_total, 2)
+        ]
+    })
+
+    return df
+
+
 
 # ----------------------------
-# OpenAI: interpretación IA (opcional) - usa st.secrets["OPENAI_API_KEY"]
+# Estado de Origen y Aplicación de Fondos (EOAF)
 # ----------------------------
-def generate_interpretation_openai(summary_text: str, model_name: str = "gpt-4o-mini"):
+
+def compute_eoaf(balance_prev: pd.DataFrame, balance_act: pd.DataFrame, results_act: pd.DataFrame):
+    """
+    Calcula el Estado de Origen y Aplicación de Fondos usando:
+    - BG anterior
+    - BG actual
+    - ER del periodo actual (para utilidad neta y depreciación)
+    """
+
+    # Mapear cuentas
+    bal_p = map_accounts(balance_prev, ACCOUNT_MAP_BALANCE)
+    bal_a = map_accounts(balance_act, ACCOUNT_MAP_BALANCE)
+    res_a = map_accounts(results_act, ACCOUNT_MAP_RESULTS)
+
+    # Copias del balance general
+    df_prev = balance_prev.copy()
+    df_act = balance_act.copy()
+
+    df_prev["Cuenta_norm"] = df_prev["Cuenta"].apply(norm_account_name)
+    df_act["Cuenta_norm"] = df_act["Cuenta"].apply(norm_account_name)
+
+    df_prev["Monto"] = to_numeric_series(df_prev["Monto"])
+    df_act["Monto"] = to_numeric_series(df_act["Monto"])
+
+    # ⭐ NUEVO: remover filas que contengan "total" en cualquier forma
+    df_prev = df_prev[~df_prev["Cuenta_norm"].str.contains("total", case=False, na=False)]
+    df_act = df_act[~df_act["Cuenta_norm"].str.contains("total", case=False, na=False)]
+
+    # Merge para comparar variaciones del BG
+    merged = df_act.merge(
+        df_prev[["Cuenta_norm", "Monto"]].rename(columns={"Monto": "Monto_Anterior"}),
+        on="Cuenta_norm",
+        how="left"
+    )
+
+    merged["Monto_Anterior"] = merged["Monto_Anterior"].fillna(0.0)
+    merged["Variación"] = merged["Monto"] - merged["Monto_Anterior"]
+
+    origenes = []
+    aplicaciones = []
+
+    def add_origen(cuenta, monto):
+        if abs(monto) > 1e-6:
+            origenes.append({"Concepto": cuenta, "Monto": round(monto, 2)})
+
+    def add_aplicacion(cuenta, monto):
+        if abs(monto) > 1e-6:
+            aplicaciones.append({"Concepto": cuenta, "Monto": round(monto, 2)})
+
+    # Clasificación EOAF
+    for _, row in merged.iterrows():
+        cuenta = row["Cuenta"]
+        variacion = row["Variación"]
+        c_norm = row["Cuenta_norm"]
+
+        if variacion == 0:
+            continue
+
+        # Activos
+        if ("activo" in c_norm or "invent" in c_norm or "caja" in c_norm or
+            "banco" in c_norm or "cobrar" in c_norm):
+            if variacion > 0:
+                add_aplicacion(f"Aumento de {cuenta}", variacion)
+            else:
+                add_origen(f"Disminución de {cuenta}", abs(variacion))
+
+        # Pasivos
+        elif ("pasivo" in c_norm or "pagar" in c_norm or "proveedor" in c_norm or
+              "obligacion" in c_norm or "deuda" in c_norm):
+            if variacion > 0:
+                add_origen(f"Aumento de {cuenta}", variacion)
+            else:
+                add_aplicacion(f"Disminución de {cuenta}", abs(variacion))
+
+        # Patrimonio
+        elif "patrimonio" in c_norm or "capital" in c_norm:
+            if variacion > 0:
+                add_origen(f"Aumento de {cuenta}", variacion)
+            else:
+                add_aplicacion(f"Disminución de {cuenta}", abs(variacion))
+
+    # Orígenes desde Estado de Resultados
+    utilidad = safe_get(res_a, "UTILIDAD_NETA")
+    depreciacion = safe_get(res_a, "DEPRECIACION")
+
+    add_origen("Utilidad Neta del Periodo", utilidad)
+    add_origen("Depreciación y Amortización", depreciacion)
+
+    df_origen = pd.DataFrame(origenes)
+    df_aplic = pd.DataFrame(aplicaciones)
+
+    total_origen = df_origen["Monto"].sum()
+    total_aplic = df_aplic["Monto"].sum()
+
+    resumen = pd.DataFrame({
+        "Tipo": ["Total Orígenes", "Total Aplicaciones", "Diferencia (O - A)"],
+        "Monto": [total_origen, total_aplic, round(total_origen - total_aplic, 2)]
+    })
+
+    return df_origen, df_aplic, resumen
+
+
+# ----------------------------
+# OpenAI: interpretación IA 
+# ----------------------------
+from google import genai 
+
+def generate_interpretation_gemini(summary: str) -> str:
+    """
+    Genera una interpretación financiera a partir de un resumen de datos usando Gemini.
+    Ahora utiliza st.secrets para leer la clave API.
+    """
     try:
-        api_key = None
-        # B1 preference: read from st.secrets OPENAI_API_KEY (recommended)
-        if "OPENAI_API_KEY" in st.secrets:
-            api_key = st.secrets["OPENAI_API_KEY"]
-        elif "openai_api_key" in st.secrets:
-            api_key = st.secrets["openai_api_key"]
-        if not api_key:
-            return "Error: OPENAI_API_KEY no encontrada en st.secrets. Añádela si quieres interpretaciones automáticas."
-        client = OpenAI(api_key=api_key)
-        system_prompt = ("Eres un analista financiero senior. En español, entrega una interpretación ejecutiva "
-                         "breve (completa) sobre liquidez, solvencia, rentabilidad y riesgos. Incluye recomendaciones concretas.")
+        # 1. OBTENER LA CLAVE API usando st.secrets
+        # Intentamos leer la clave del archivo .streamlit/secrets.toml
         try:
-            # New Responses API
-            response = client.responses.create(
-                model=model_name,
-                input=[{"role":"system","content":system_prompt},{"role":"user","content":summary_text}],
-                max_output_tokens=500,
-                temperature=0.12
-            )
-            # Parse response safely
-            if hasattr(response, "output"):
-                out = response.output
-                # Look for output_text
-                if isinstance(out, list):
-                    text_blocks = []
-                    for block in out:
-                        if isinstance(block, dict):
-                            content = block.get("content", [])
-                            if isinstance(content, list):
-                                for c in content:
-                                    if isinstance(c, dict) and c.get("type") == "output_text":
-                                        text_blocks.append(c.get("text", ""))
-                    if text_blocks:
-                        return "\n\n".join(text_blocks).strip()
-                # fallback str
-                return str(out)
-        except Exception:
-            try:
-                # Fallback to chat completions (older endpoints)
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role":"system","content":system_prompt},{"role":"user","content":summary_text}],
-                    temperature=0.12,
-                    max_tokens=500
-                )
-                if hasattr(response, "choices") and len(response.choices) > 0:
-                    choice = response.choices[0]
-                    if hasattr(choice, "message") and isinstance(choice.message, dict):
-                        return choice.message.get("content", "").strip()
-                    return getattr(choice, "text", str(choice))
-            except Exception as e2:
-                return f"Error al llamar la API de OpenAI: {e2}"
-        return "No se pudo extraer la respuesta de OpenAI. Revisa la configuración del SDK y la clave."
-    except Exception as e:
-        return f"Error interno: {e}"
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except KeyError:
+            return "Error: La clave 'GEMINI_API_KEY' no se encontró en el archivo .streamlit/secrets.toml."
+        
+        # 2. INICIALIZAR EL CLIENTE CON LA CLAVE
+        client = genai.Client(api_key=api_key) 
+        
+        # Define un prompt de sistema para dar contexto al modelo
+        system_prompt = (
+            "Eres un analista financiero experto. Tu tarea es analizar el siguiente resumen de "
+            "estados financieros, razones financieras (ratios) y métricas (KPIs). "
+            "Genera un informe no tan extenso que sea conciso y profesional, destacando los puntos clave "
+            "de la salud financiera, la rentabilidad y la liquidez."
+        )
 
+        # Genera la respuesta
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',  # Modelo rápido y eficiente
+            contents=[system_prompt, f"Resumen financiero para analizar:\n\n{summary}"],
+        )
+        
+        return response.text
+
+    except Exception as e:
+        # Este 'except' capturará cualquier otro error (como problemas de red o la API)
+        return f"Error al generar la interpretación con Gemini: {e}"
 # ----------------------------
 # AGGrid helper
 # ----------------------------
@@ -541,10 +846,14 @@ def make_download_button_bytes(content_bytes: bytes, filename: str, mime: str):
 # ----------------------------
 # Sidebar - navegación
 # ----------------------------
+# DEBUG: comprobar etiquetas exactas (ver si hay espacios o caracteres invisibles)
 st.sidebar.header("Secciones - FinanSys")
-section = st.sidebar.radio("Selecciona la sección:",
-                           ["Inicio", "Cargar archivos", "Análisis vertical", "Análisis horizontal",
-                            "Razones financieras", "DuPont", "Flujo de efectivo", "KPIs", "Interpretación"])
+sections = ["Inicio", "Crear BG / ER", "Cargar archivos", "Análisis vertical", "Análisis horizontal",
+            "Razones financieras", "DuPont", "Flujo de efectivo", "Origen y Aplicación de Fondos", "KPIs", "Interpretación"]
+
+
+
+section = st.sidebar.radio("Selecciona la sección:", sections)
 
 # ----------------------------
 # Sección: Inicio
@@ -565,6 +874,191 @@ if section == "Inicio":
         else:
             st.markdown("<div class='card'><div class='small-muted'>Sin datos cargados aún</div></div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+# ----------------------------
+# Crear Estado de Resultado/ Balance General
+# ----------------------------
+elif section == "Crear BG / ER":
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<h3 class='subheader'>Constructor de Balance General / Estado de Resultado</h3>", unsafe_allow_html=True)
+
+    # Selección de tipo
+    tipo = st.radio("¿Qué deseas crear?", ["Balance General", "Estado de Resultado"], key="tipo_crear")
+
+    # Selección de periodicidad
+    periodicidad = st.radio("Periodicidad del estado financiero", ["Anual", "Mensual"], key="periodicidad_crear")
+
+    # Selección de año
+    año = st.number_input("Año del estado financiero:", min_value=1900, max_value=2100, value=2024, key="anio_crear")
+
+    # Si es mensual → Seleccionar mes
+    if periodicidad == "Mensual":
+        meses = [
+            "Enero","Febrero","Marzo","Abril","Mayo","Junio",
+            "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"
+        ]
+        mes_nombre = st.selectbox("Selecciona el mes:", meses)
+        mes_num = meses.index(mes_nombre) + 1
+    else:
+        mes_num = None
+
+    # --------------------------------------------------------------------
+    # 🔥 SELECCIONAR O CREAR EMPRESA
+    # --------------------------------------------------------------------
+    st.write("### Empresa")
+
+    modo = st.radio(
+        "¿Qué deseas hacer?",
+        ["Seleccionar empresa existente", "Crear nueva empresa"],
+        horizontal=True,
+        key="seleccion_empresa"
+    )
+
+    empresas = db.obtener_empresas()
+    empresas_dict = {nombre: emp_id for emp_id, nombre in empresas}
+
+    empresa_id = None
+
+    if modo == "Seleccionar empresa existente":
+        if not empresas:
+            st.warning("No hay empresas registradas. Crea una nueva.")
+        else:
+            empresa_nombre = st.selectbox("Selecciona la empresa:", list(empresas_dict.keys()))
+            empresa_id = empresas_dict[empresa_nombre]
+
+    else:
+        st.markdown("#### Registrar nueva empresa")
+        nueva_empresa = st.text_input("Nombre de la empresa", key="nueva_empresa")
+        nuevo_sector = st.text_input("Sector (opcional)", key="nuevo_sector")
+
+        if st.button("Registrar empresa", key="registrar_empresa_btn"):
+            if nueva_empresa.strip() == "":
+                st.error("El nombre es obligatorio.")
+            else:
+                from datetime import date
+                db.crear_empresa(nueva_empresa.strip(), nuevo_sector.strip(), str(date.today()))
+                st.success(f"Empresa '{nueva_empresa}' creada correctamente. Ya puedes seleccionarla.")
+                st.rerun()
+
+
+    st.write("### Cuentas predeterminadas")
+
+    # Cuentas estándar según tipo
+    cuentas_bg = {
+        "Activo Corriente": ["Caja", "Bancos", "Clientes", "Inventarios", "Otros Activos Corrientes"],
+        "Activo No Corriente": ["Propiedad, Planta y Equipo", "Intangibles", "Inversiones a Largo Plazo"],
+        "Pasivo Corriente": ["Proveedores", "Acreedores", "Obligaciones Bancarias CP"],
+        "Pasivo No Corriente": ["Préstamos LP", "Obligaciones Financieras LP"],
+        "Capital Contable": ["Capital Social", "Utilidades Retenidas"]
+    }
+
+    cuentas_er = {
+        "Ingresos": ["Ventas", "Ingresos Operativos", "Otros Ingresos"],
+        "Costos": ["Costo de Ventas", "Costos Operativos"],
+        "Gastos": ["Gastos de Administración", "Gastos de Venta", "Gastos Financieros"]
+    }
+
+    clasificaciones = cuentas_bg if tipo == "Balance General" else cuentas_er
+    clasificacion = st.selectbox("Selecciona la clasificación:", list(clasificaciones.keys()), key="clasificacion_crear")
+
+    cuenta_seleccionada = st.selectbox(
+        "Selecciona una cuenta predeterminada:",
+        clasificaciones[clasificacion],
+        key="cuenta_predet"
+    )
+
+    nueva_cuenta = st.text_input("O escribe una cuenta nueva:", key="nueva_cuenta")
+
+    # Monto
+    st.markdown("#### Monto (al agregar la cuenta)")
+    col_m1, col_m2 = st.columns([2,1])
+    with col_m1:
+        monto_input = st.text_input("Monto (ej.: 1200.50 o -500)", value="0", key="monto_input")
+
+    with col_m2:
+        add_pressed = st.button("➕ Agregar cuenta a la tabla", key="add_account")
+
+    # Preparar df
+    if "df_edit" not in st.session_state:
+        st.session_state.df_edit = pd.DataFrame({"Cuenta": [], "Monto": []})
+
+    # Agregar cuenta
+    if add_pressed:
+        cuenta_final = nueva_cuenta.strip() if nueva_cuenta.strip() else cuenta_seleccionada
+
+        try:
+            monto_val = parse_number(monto_input)
+        except:
+            monto_val = np.nan
+
+        if monto_val is None or (isinstance(monto_val, float) and np.isnan(monto_val)):
+            st.warning("Monto inválido.")
+        else:
+            st.session_state.df_edit.loc[len(st.session_state.df_edit)] = [cuenta_final, monto_val]
+            st.success(f"Cuenta '{cuenta_final}' agregada.")
+
+    # Tabla editable
+    st.write("### Edita tu tabla (como Excel):")
+    gb = GridOptionsBuilder.from_dataframe(st.session_state.df_edit)
+    gb.configure_default_column(editable=True, resizable=True)
+    gb.configure_grid_options(enableRangeSelection=True)
+
+    grid = AgGrid(
+        st.session_state.df_edit,
+        gridOptions=gb.build(),
+        theme="dark",
+        height=300,
+        update_mode="MODEL_CHANGED",
+        allow_unsafe_jscode=True,
+        key="aggrid_creador"
+    )
+
+    st.session_state.df_edit = grid["data"]
+
+    if st.button("🧹 Limpiar tabla", key="limpiar_tabla"):
+        st.session_state.df_edit = pd.DataFrame({"Cuenta": [], "Monto": []})
+        st.success("Tabla limpiada.")
+
+    # GUARDAR BG / ER
+    if st.button("💾 Guardar estado financiero", key="guardar_estado"):
+
+        if empresa_id is None:
+            st.error("Debes seleccionar o crear una empresa antes de guardar.")
+            st.stop()
+
+        df_final = pd.DataFrame(st.session_state.df_edit).copy()
+
+        if df_final.empty:
+            st.error("La tabla no puede estar vacía.")
+            st.stop()
+
+        df_final["Cuenta"] = df_final["Cuenta"].astype(str).str.strip()
+        df_final["Monto"] = to_numeric_series(df_final["Monto"])
+
+        df_final = df_final[df_final["Cuenta"] != ""].reset_index(drop=True)
+
+        if df_final.empty:
+            st.error("No quedan cuentas válidas.")
+            st.stop()
+
+        if df_final["Monto"].isna().any():
+            st.error("Hay montos inválidos.")
+            st.stop()
+
+        # Guardar en BD (con periodicidad mensual o anual)
+        for _, row in df_final.iterrows():
+            db.guardar_estado(
+                empresa_id=empresa_id,
+                tipo_estado="BG" if tipo == "Balance General" else "ER",
+                periodicidad="mensual" if periodicidad == "Mensual" else "anual",
+                año=año,
+                mes=mes_num,
+                cuenta=row["Cuenta"],
+                monto=float(row["Monto"])
+            )
+
+        st.success(f"{tipo} guardado exitosamente en la base de datos.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ----------------------------
 # Sección: Cargar archivos
@@ -572,9 +1066,24 @@ if section == "Inicio":
 elif section == "Cargar archivos":
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<h3 class='subheader'>Carga tus archivos (BG y ER)</h3>", unsafe_allow_html=True)
-    uploaded_bg = st.file_uploader("Balances Generales (BG) - acepta múltiples", type=["xlsx", "csv"], accept_multiple_files=True, key="u_bg")
-    uploaded_er = st.file_uploader("Estados de Resultados (ER) - acepta múltiples", type=["xlsx", "csv"], accept_multiple_files=True, key="u_er")
 
+    uploaded_bg = st.file_uploader(
+        "Balances Generales (BG) - acepta múltiples",
+        type=["xlsx", "csv"],
+        accept_multiple_files=True,
+        key="u_bg"
+    )
+
+    uploaded_er = st.file_uploader(
+        "Estados de Resultados (ER) - acepta múltiples",
+        type=["xlsx", "csv"],
+        accept_multiple_files=True,
+        key="u_er"
+    )
+
+    # ---------------------------
+    # Función robusta para lectura
+    # ---------------------------
     def process_upload_list(uploaded):
         files = []
         if uploaded:
@@ -584,18 +1093,25 @@ elif section == "Cargar archivos":
                         df = pd.read_csv(f)
                     else:
                         df = pd.read_excel(f)
-                    # normalize column names if user uses different headers
+
+                    # Normalizar columnas
                     cols = {c.lower().strip(): c for c in df.columns}
-                    # Try to detect Cuenta and Monto equivalent
-                    cuenta_col = None; monto_col = None
+
+                    cuenta_col = None
+                    monto_col = None
+
+                    # Detección flexible
                     for k, orig in cols.items():
                         if k in ["cuenta", "descripcion", "nombre", "concepto", "detalle"]:
                             cuenta_col = orig
                         if k in ["monto", "saldo", "valor", "importe", "total"]:
                             monto_col = orig
-                    # fallback: exact names
+
+                    # Detección exacta
                     if 'Cuenta' in df.columns and 'Monto' in df.columns:
-                        cuenta_col = 'Cuenta'; monto_col = 'Monto'
+                        cuenta_col = 'Cuenta'
+                        monto_col = 'Monto'
+
                     if cuenta_col and monto_col:
                         df2 = df[[cuenta_col, monto_col]].copy()
                         df2.columns = ["Cuenta", "Monto"]
@@ -603,33 +1119,68 @@ elif section == "Cargar archivos":
                         df2['Monto'] = to_numeric_series(df2['Monto'])
                         files.append((f.name.replace('.xlsx','').replace('.csv',''), df2))
                     else:
-                        st.warning(f"Archivo {f.name} omitido: requiere columnas 'Cuenta' y 'Monto' o equivalentes.")
+                        st.warning(
+                            f"⚠ Archivo {f.name} omitido: requiere columnas 'Cuenta' y 'Monto' o equivalentes."
+                        )
+
                 except Exception as e:
                     st.error(f"Error al procesar {f.name}: {e}")
+
         files.sort(key=lambda x: x[0])
         return files
 
-    if st.button("Procesar archivos", type='primary'):
-        st.session_state.balances = process_upload_list(uploaded_bg)
-        st.session_state.resultados = process_upload_list(uploaded_er)
-        if st.session_state.balances or st.session_state.resultados:
-            st.success("Archivos procesados y guardados en session_state.")
-        if len(st.session_state.balances) != len(st.session_state.resultados):
-            st.warning("Se recomienda tener igual número de BG y ER por período para análisis completos.")
+    # -----------------------------------------------------------------
+    # ❗ RESTRICCIÓN: solo mostrar botón si subieron al menos un archivo
+    # -----------------------------------------------------------------
+    if uploaded_bg or uploaded_er:
 
-    # Previews
-    if st.session_state.balances:
-        st.markdown("#### Previews - Balances")
-        for name, df in st.session_state.balances[:3]:
-            st.markdown(f"**{name}**")
-            aggrid_dark(df.head(8), height=180)
-    if st.session_state.resultados:
-        st.markdown("#### Previews - Resultados")
-        for name, df in st.session_state.resultados[:3]:
-            st.markdown(f"**{name}**")
-            aggrid_dark(df.head(8), height=180)
+        # ⭐ BOTÓN ADENTRO DEL ELIF (ya no sale en otras secciones)
+        if st.button("Procesar archivos", type='primary', key="procesar_archivos"):
+
+            import time
+            progress = st.progress(0)
+            status = st.empty()
+            status.write("Procesando archivos...")
+
+            for i in range(100):
+                time.sleep(0.01)
+                progress.progress(i + 1)
+
+            # Procesar
+            st.session_state.balances = process_upload_list(uploaded_bg)
+            st.session_state.resultados = process_upload_list(uploaded_er)
+
+            status.write("✔ ¡Archivos procesados!")
+
+            # Verificaciones
+            if not st.session_state.balances and not st.session_state.resultados:
+                st.error("❌ Ningún archivo válido fue procesado.")
+                st.stop()
+
+            if st.session_state.balances or st.session_state.resultados:
+                st.success("Archivos procesados y guardados en session_state.")
+
+            if len(st.session_state.balances) != len(st.session_state.resultados):
+                st.warning("⚠ Se recomienda igual número de BG y ER por período.")
+
+            # Previews
+            if st.session_state.balances:
+                st.markdown("#### Previews - Balances")
+                for name, df in st.session_state.balances[:3]:
+                    st.markdown(f"**{name}**")
+                    aggrid_dark(df.head(8), height=180)
+
+            if st.session_state.resultados:
+                st.markdown("#### Previews - Resultados")
+                for name, df in st.session_state.resultados[:3]:
+                    st.markdown(f"**{name}**")
+                    aggrid_dark(df.head(8), height=180)
+
+    else:
+        st.info("Sube al menos un archivo para habilitar el botón 'Procesar archivos'.")
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ----------------------------
 # Sección: Análisis vertical
@@ -817,8 +1368,97 @@ elif section == "Flujo de efectivo":
         html_report = df_to_html_report(f"Estado de Flujo - {prev} → {act}", {"Flujo Indirecto": df_efe_ind, "Flujo Directo": df_efe_dir, "KPIs": pd.DataFrame([{"Concepto":"Flujo Operativo (A)","Monto":A},{"Concepto":"Flujo Inversión (B)","Monto":B},{"Concepto":"Flujo Financiamiento (C)","Monto":C},{"Concepto":"Flujo Neto","Monto":N}])})
         html_bytes = html_report.encode('utf-8')
         st.download_button("Exportar Informe (HTML, imprimir a PDF)", data=html_bytes, file_name=f"{export_name_base}.html", mime="text/html")
-
     st.markdown("</div>", unsafe_allow_html=True)
+
+# ----------------------------
+# Sección: Estado de Origen y Aplicación
+# ----------------------------
+
+elif section == "Origen y Aplicación de Fondos":
+    import traceback
+
+    try:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h3 class='subheader'>Estado de Origen y Aplicación de Fondos (EOAF)</h3>", unsafe_allow_html=True)
+
+        # Verificar si hay al menos 2 BG
+        if len(st.session_state.balances) < 2:
+            st.warning("Necesitas al menos dos Balances Generales consecutivos para elaborar el EOAF.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.stop()
+
+        # ---- Selección de períodos ----
+        names = [n for n, _ in st.session_state.balances]
+        act = st.selectbox("Periodo Actual", names, index=len(names) - 1)
+        prev = st.selectbox("Periodo Anterior", names, index=max(0, len(names) - 2))
+
+        idx_act = names.index(act)
+        idx_prev = names.index(prev)
+
+        bal_prev_df = st.session_state.balances[idx_prev][1]
+        bal_act_df = st.session_state.balances[idx_act][1]
+
+        # ---- ER del periodo actual ----
+        if not st.session_state.resultados:
+            st.warning("No hay Estados de Resultado cargados — solo se usarán variaciones de BG.")
+            er_df = None
+        else:
+            # Emparejar el ER más cercano al BG actual
+            idx_er = min(idx_act, len(st.session_state.resultados) - 1)
+            er_df = st.session_state.resultados[idx_er][1]
+
+        # ---- Calcular EOAF ----
+        try:
+            df_origen, df_aplic, df_resumen = compute_eoaf(bal_prev_df, bal_act_df, er_df)
+        except Exception:
+            st.error("Error en compute_eoaf(). Traza:")
+            st.code(traceback.format_exc())
+            st.stop()
+
+        # ---- Mostrar tablas ----
+        st.markdown("### Orígenes de Fondos")
+        aggrid_dark(df_origen if df_origen is not None and not df_origen.empty 
+                    else pd.DataFrame(columns=["Concepto", "Monto"]), height=260)
+
+        st.markdown("### Aplicaciones de Fondos")
+        aggrid_dark(df_aplic if df_aplic is not None and not df_aplic.empty 
+                    else pd.DataFrame(columns=["Concepto", "Monto"]), height=260)
+
+        st.markdown("### Resumen EOAF")
+        aggrid_dark(df_resumen if df_resumen is not None and not df_resumen.empty 
+                    else pd.DataFrame(columns=["Tipo", "Monto"]), height=140)
+
+        # ---- Exports ----
+        excel_bytes = df_to_excel_bytes({
+            "Orígenes": df_origen if df_origen is not None else pd.DataFrame(columns=["Concepto", "Monto"]),
+            "Aplicaciones": df_aplic if df_aplic is not None else pd.DataFrame(columns=["Concepto", "Monto"]),
+            "Resumen": df_resumen if df_resumen is not None else pd.DataFrame(columns=["Tipo", "Monto"])
+        })
+
+        st.download_button(
+            "Exportar EOAF (Excel)", 
+            data=excel_bytes,
+            file_name=f"EOAF_{prev}_to_{act}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        st.download_button(
+            "Exportar Orígenes (CSV)",
+            data=df_to_csv_bytes(df_origen if df_origen is not None else pd.DataFrame(columns=["Concepto","Monto"])),
+            file_name=f"EOAF_Origenes_{prev}_to_{act}.csv"
+        )
+
+        st.download_button(
+            "Exportar Aplicaciones (CSV)",
+            data=df_to_csv_bytes(df_aplic if df_aplic is not None else pd.DataFrame(columns=["Concepto","Monto"])),
+            file_name=f"EOAF_Aplicaciones_{prev}_to_{act}.csv"
+        )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    except Exception:
+        st.error("⚠ Ocurrió un error inesperado en la sección EOAF.")
+        st.code(traceback.format_exc())
 
 # ----------------------------
 # Sección: KPIs (Dashboard de indicadores)
@@ -871,12 +1511,12 @@ elif section == "KPIs":
 # ----------------------------
 elif section == "Interpretación":
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<h3 class='subheader'>Interpretación Ejecutiva (IA)</h3>", unsafe_allow_html=True)
+    st.markdown("<h3 class='subheader'>Interpretación Ejecutiva </h3>", unsafe_allow_html=True)
     if not st.session_state.ratios:
         st.warning("Calcula las razones primero en 'Razones financieras'.")
     else:
         # Construir resumen
-        summary = "Resumen FinanSys para interpretación (en español):\n\n"
+        summary = "Resumen FinanSys para interpretación:\n\n"
         if st.session_state.balances:
             name, df = st.session_state.balances[0]
             dv = vertical_analysis(name, df, 'BG')
@@ -903,7 +1543,7 @@ elif section == "Interpretación":
 
         if st.button('Generar interpretación '):
             with st.spinner('Generando interpretación...'):
-                text = generate_interpretation_openai(summary)
+                text = generate_interpretation_gemini(summary)
                 if text.lower().startswith('error') or 'no se' in text.lower():
                     st.error(text)
                 else:
