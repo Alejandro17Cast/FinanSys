@@ -884,7 +884,17 @@ def compute_ratios(bg, er):
     # ========================
     # BALANCE GENERAL
     # ========================
-    activos = bg[bg["cuenta"].str.contains(r"activo", na=False)]["monto"].sum()
+    activos = bg[bg["cuenta"].str.contains(
+         r"^total activo$|activo total",
+         regex=True,
+        na=False
+    )]["monto"].sum()
+
+    if activos == 0:
+        activos = bg[bg["cuenta"].str.contains(
+        r"caja|banco|inventario|cuentas por cobrar|activo fijo|propiedad|planta|equipo",
+        na=False
+    )]["monto"].sum()
 
     # Si no hay Total Activos explícito, sumamos todo lo que sea activo
     if activos == 0:
@@ -893,9 +903,30 @@ def compute_ratios(bg, er):
             na=False
         )]["monto"].sum()
 
-    pasivos = bg[bg["cuenta"].str.contains(r"pasivo", na=False)]["monto"].sum()
+    pasivos = bg[bg["cuenta"].str.contains(
+         r"^total pasivo$|pasivo total",
+         regex=True,
+         na=False
+    )]["monto"].sum()
+    if pasivos == 0:
+         pasivos = bg[bg["cuenta"].str.contains(
+        r"proveedor|deuda|prestamo|obligacion|cuentas por pagar",
+        na=False
+    )]["monto"].sum()
 
-    capital = bg[bg["cuenta"].str.contains(r"capital|patrimonio", na=False)]["monto"].sum()
+
+    capital = bg[bg["cuenta"].str.contains(
+          r"^total patrimonio$|patrimonio total",
+         regex=True,
+         na=False
+    )]["monto"].sum()
+
+    if capital == 0:
+       capital = bg[bg["cuenta"].str.contains(
+        r"capital social|utilidades retenidas|patrimonio",
+        na=False
+    )]["monto"].sum()
+       
 
     activos_corr = bg[bg["cuenta"].str.contains(
         r"activo circulante|activo corriente|caja|banco|efectivo",
@@ -995,6 +1026,7 @@ def compute_ratios(bg, er):
     margen_operativo = utilidad_operativa / ventas if ventas != 0 else np.nan
     margen_neto = utilidad_neta / ventas if ventas != 0 else np.nan
     roa = utilidad_neta / activos if activos != 0 else np.nan
+    roe = utilidad_neta / capital if capital != 0 else np.nan
 
     # ========================
     # RESULTADO
@@ -1013,7 +1045,8 @@ def compute_ratios(bg, er):
         "Margen Bruto": margen_bruto,
         "Margen Operativo": margen_operativo,
         "Margen Neto": margen_neto,
-        "ROA": roa
+        "ROA": roa,
+        "ROE":roe,
     }
 
     return razones
@@ -1091,29 +1124,30 @@ def compute_dupont(balance_df, results_df):
     # ACTIVO TOTAL
     # ==============================
     activo_total = sumar_por_palabras(
-        bg, col_cuenta_bg, col_monto_bg,
+         bg, col_cuenta_bg, col_monto_bg,
         ["total activo", "activo total"]
     )
 
+# Si no existe el total, sumamos SOLO las cuentas principales de activo
     if activo_total == 0:
-        activo_total = sumar_por_palabras(
-            bg, col_cuenta_bg, col_monto_bg,
-            DUPONT_BALANCE_CUENTAS["activo"]
-        )
-
+       activo_total = sumar_por_palabras(
+        bg, col_cuenta_bg, col_monto_bg,
+        ["caja", "bancos", "inventario", "clientes", 
+         "propiedad", "planta", "equipo", "activo fijo"]
+    )
     # ==============================
     # PATRIMONIO
     # ==============================
     patrimonio = sumar_por_palabras(
-        bg, col_cuenta_bg, col_monto_bg,
-        ["total patrimonio", "patrimonio"]
-    )
+         bg, col_cuenta_bg, col_monto_bg,
+        ["total patrimonio"]
+   )
 
     if patrimonio == 0:
         patrimonio = sumar_por_palabras(
-            bg, col_cuenta_bg, col_monto_bg,
-            DUPONT_BALANCE_CUENTAS["patrimonio"]
-        )
+        bg, col_cuenta_bg, col_monto_bg,
+        ["capital social", "utilidades retenidas", "patrimonio"]
+    )
 
     # ==============================
     # VENTAS
@@ -1289,7 +1323,7 @@ def compute_cashflow_indirect(balance_df_act: pd.DataFrame,
     })
 
     return df
-    return df
+    
 def compute_cashflow_direct(balance_df_act: pd.DataFrame, results_df_act: pd.DataFrame) -> pd.DataFrame:
     """
     Flujo de Efectivo Método DIRECTO adaptado a tu BD:
@@ -1480,31 +1514,28 @@ def compute_eoaf(balance_prev, balance_act, results_act):
         tipo = row["Tipo_norm"]
         cuenta_norm = row["Cuenta_norm"]
 
-        # ========== ACTIVO ==========
-        if "activo" in tipo or any(x in cuenta_norm for x in [
-            "caja", "banco", "invent", "cobrar",
-            "fijo", "maquinaria", "equipo",
-            "vehiculo", "terreno", "mobiliario"
-        ]):
+       # ========== ACTIVO ==========
+    if any(x in cuenta_norm for x in [
+    "caja", "banco", "efectivo",
+    "invent", "cobrar", "cliente",
+    "fijo", "maquinaria", "equipo",
+    "vehiculo", "terreno", "mobiliario"
+    ]):
 
-            # Si es activo fijo, evitar duplicarlo si fue financiado
-            if any(x in cuenta_norm for x in ["fijo", "maquinaria", "equipo"]):
+    # Activo fijo
+     if any(x in cuenta_norm for x in ["fijo", "maquinaria", "equipo"]):
 
-                if variacion > 0:
+        if variacion > 0:
+            add_aplic(f"Aumento de activo fijo: {cuenta}", variacion)
+        elif variacion < 0:
+            add_origen(f"Disminución de activo fijo: {cuenta}", abs(variacion))
 
-                    parte_efectivo = max(0, variacion - financiamiento_total)
-
-                    if parte_efectivo > 0:
-                        add_aplic(f"Aumento de activo fijo (parte pagada): {cuenta}", parte_efectivo)
-
-                elif variacion < 0:
-                    add_origen(f"Disminución de activo fijo: {cuenta}", abs(variacion))
-
-            else:
-                if variacion > 0:
-                    add_aplic(f"Aumento de {cuenta}", variacion)
-                elif variacion < 0:
-                    add_origen(f"Disminución de {cuenta}", abs(variacion))
+    else:
+        # Activo corriente
+        if variacion > 0:
+            add_aplic(f"Aumento de {cuenta}", variacion)
+        elif variacion < 0:
+            add_origen(f"Disminución de {cuenta}", abs(variacion))
 
         # ========== PASIVO ==========
         elif "pasivo" in tipo or any(x in cuenta_norm for x in [
